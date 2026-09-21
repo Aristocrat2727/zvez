@@ -4,7 +4,6 @@ import asyncio
 import random
 import logging
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -14,10 +13,12 @@ from telethon.errors import (
     UserAlreadyParticipantError,
     ChannelPrivateError,
     AuthKeyUnregisteredError,
+    AuthKeyDuplicatedError,
     InviteHashExpiredError,
     InviteHashInvalidError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
+    PeerIdInvalidError,
 )
 from telethon.sessions import StringSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -36,6 +37,7 @@ BONUS_TZ = zoneinfo.ZoneInfo("Europe/Samara")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("zvezdolov")
+logging.getLogger("telethon").setLevel(logging.WARNING)
 
 # =========================================================
 #                 СЛУЖЕБНЫЕ ССЫЛКИ TELEGRAM
@@ -43,7 +45,7 @@ log = logging.getLogger("zvezdolov")
 SKIP_USERNAMES = {
     "share", "addstickers", "addemoji", "proxy", "socks",
     "setlanguage", "joinchat", "iv", "c", "s", "addtheme",
-    "login", "confirmphone", "socks", "bg", "addlist",
+    "login", "confirmphone", "bg", "addlist",
 }
 
 
@@ -60,7 +62,7 @@ if not SESSIONS and os.environ.get("SESSION_STR"):
     SESSIONS.append((1, os.environ["SESSION_STR"].strip()))
 
 if not SESSIONS:
-    log.error("❌ Нет сессий. Добавь SESSION_STR_1, SESSION_STR_2...")
+    log.error("❌ Нет сессий")
     raise SystemExit(1)
 
 log.info(f"🔑 Сессий загружено: {len(SESSIONS)}")
@@ -70,6 +72,8 @@ clients = [
     for idx, sess in SESSIONS
 ]
 
+dead_clients = set()
+
 
 # =========================================================
 #                     ХЕЛПЕРЫ
@@ -78,12 +82,14 @@ async def human_pause(min_s=1.0, max_s=3.0):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 
-def extract_invite_or_username(url: str):
+def classify_link(url: str):
     """
-    Возвращает:
-      ('invite', hash)     — для t.me/+hash и t.me/joinchat/hash
-      ('username', name)   — для t.me/name
-      None                 — если служебная ссылка
+    Определяет тип ссылки:
+      ('invite', hash)          — t.me/+hash
+      ('bot', username)         — t.me/usernamebot (обычный бот)
+      ('channel', username)     — t.me/username (канал)
+      ('webapp', (bot, short))  — t.me/bot/app (mini app — пропускаем)
+      None                      — служебная или непонятная
     """
     if not url:
         return None
@@ -95,84 +101,111 @@ def extract_invite_or_username(url: str):
         if skip in url:
             return None
 
-    # Invite-ссылка: t.me/+hash  или  t.me/joinchat/hash
+    # Mini app: t.me/bot/app
+    m = re.search(r"t\.me/([A-Za-z][A-Za-z0-9_]{3,31})/([A-Za-z0-9_]+)", url)
+    if m:
+        bot_name = m.group(1)
+        short = m.group(2)
+        if bot_name.lower().endswith("bot") or short in ("app", "play", "start"):
+            return ("webapp", (bot_name, short))
+
+    # Invite
     m = re.search(r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", url)
     if m:
         return ("invite", m.group(1))
 
-    # Публичный канал: t.me/username
-    m = re.search(r"t\.me/([A-Za-z][A-Za-z0-9_]{3,31})", url)
+    # Просто username
+    m = re.search(r"t\.me/([A-Za-z][A-Za-z0-9_]{3,31})/?$", url)
     if m:
         username = m.group(1)
         if username.lower() in SKIP_USERNAMES:
             return None
-        return ("username", username)
+        # Если username заканчивается на bot — это бот
+        if username.lower().endswith("bot"):
+            return ("bot", username)
+        return ("channel", username)
 
     return None
 
 
-async def subscribe(c: TelegramClient, kind: str, value: str) -> bool:
-    """Подписка: по invite-хэшу или по username. Все ошибки обрабатываются."""
+async def subscribe_or_start(c: TelegramClient, kind: str, value) -> bool:
+    """Подписка на канал, старт бота или пропуск webapp."""
     try:
+        # --- WEBAPP (пропускаем) ---
+        if kind == "webapp":
+            bot_username, short = value
+            log.info(f"   ⏭ WebApp пропущен: @{bot_username}/{short} (требует ручного)")
+            return False
+
+        # --- ОБЫЧНЫЙ БОТ: пишем /start ---
+        if kind == "bot":
+            await c.send_message(value, "/start")
+            log.info(f"   🤖 Зашёл в бота: @{value} → /start")
+            await human_pause(2.0, 4.0)
+            return True
+
+        # --- INVITE-КАНАЛ ---
         if kind == "invite":
             await c(ImportChatInviteRequest(value))
             log.info(f"   ✅ Подписался (invite): +{value}")
-        else:
+            return True
+
+        # --- ПУБЛИЧНЫЙ КАНАЛ ---
+        if kind == "channel":
             await c(JoinChannelRequest(value))
             log.info(f"   ✅ Подписался: @{value}")
-        return True
+            return True
+
+        return False
 
     except UserAlreadyParticipantError:
         log.info(f"   ℹ️ Уже подписан: {value}")
         return True
-
     except InviteHashExpiredError:
         log.warning(f"   ⏰ Invite просрочена: +{value}")
         return False
-
     except InviteHashInvalidError:
         log.warning(f"   ❌ Неверный invite: +{value}")
         return False
-
     except ChannelPrivateError:
         log.warning(f"   🚫 Закрытый канал: {value}")
         return False
-
     except (UsernameInvalidError, UsernameNotOccupiedError):
-        log.info(f"   ⏭ Пропуск (недействительный username): {value}")
+        log.info(f"   ⏭ Недействительный username: {value}")
         return False
-
+    except PeerIdInvalidError:
+        log.info(f"   ⏭ PeerId invalid: {value}")
+        return False
     except FloodWaitError as e:
-        log.warning(f"   ⏳ FloodWait {e.seconds}с — ждём")
+        log.warning(f"   ⏳ FloodWait {e.seconds}с")
         await asyncio.sleep(e.seconds)
         return False
-
+    except AuthKeyDuplicatedError:
+        log.error(f"   🚫 СЕССИЯ ОТОЗВАНА (дубликат IP)")
+        raise
     except TypeError as e:
-        # "Cannot cast InputPeerUser to InputChannel" — ссылка на юзера/бота
         if "InputPeerUser" in str(e) or "InputChannel" in str(e):
-            log.info(f"   ⏭ Пропуск (это юзер/бот, а не канал): {value}")
+            log.info(f"   ⏭ Пропуск (юзер/бот, не канал): {value}")
             return False
         log.warning(f"   ❌ TypeError: {e}")
         return False
-
     except Exception as e:
         err = str(e)
         if "Nobody is using this username" in err or "username is unacceptable" in err:
-            log.info(f"   ⏭ Пропуск (невалидный username): {value}")
+            log.info(f"   ⏭ Невалидный username: {value}")
             return False
-        log.warning(f"   ❌ Ошибка подписки {value}: {e}")
+        log.warning(f"   ❌ Ошибка: {e}")
         return False
 
 
 async def press_button(c: TelegramClient, msg, keyword: str) -> bool:
-    """Нажимает inline callback-кнопку по ключевому слову."""
     if not msg.buttons:
         return False
     for row in msg.buttons:
         for btn in row:
             if keyword.lower() in btn.text.lower():
                 if btn.url:
-                    continue  # URL-кнопки не жмём через callback
+                    continue
                 try:
                     await btn.click()
                     log.info(f"   👆 Нажал: '{btn.text}'")
@@ -188,6 +221,9 @@ async def press_button(c: TelegramClient, msg, keyword: str) -> bool:
 # =========================================================
 def make_handler(idx: int, c: TelegramClient):
     async def handler(event):
+        if idx in dead_clients:
+            return
+
         msg = event.message
         try:
             if msg.text:
@@ -197,34 +233,31 @@ def make_handler(idx: int, c: TelegramClient):
             if msg.buttons:
                 log.info(f"   🔘 [акк {idx}] Кнопок: {len(msg.buttons)}")
 
-                # 1. Собираем ссылки из URL-кнопок
-                links = []
+                # Проходим по всем URL-кнопкам
                 for row in msg.buttons:
                     for btn in row:
                         if btn.url:
-                            info = extract_invite_or_username(btn.url)
+                            info = classify_link(btn.url)
                             if info:
-                                links.append(info)
+                                kind, value = info
+                                await subscribe_or_start(c, kind, value)
+                                await human_pause(2.5, 6.0)
 
-                if links:
-                    log.info(f"   📡 [акк {idx}] Каналов для подписки: {len(links)}")
-                    for kind, value in links:
-                        await subscribe(c, kind, value)
-                        await human_pause(2.5, 6.0)
-
-                # 2. Жмём «Я подписался» / «Проверить»
+                # Жмём "Я подписался" / "Проверить"
                 clicked = await press_button(c, msg, "подписался")
                 if not clicked:
                     clicked = await press_button(c, msg, "проверить")
 
-                # 3. Если не нашли — пробуем другие полезные кнопки
                 if not clicked:
                     for kw in ["забрать", "получить", "ускорить", "обновить", "бонус"]:
                         if await press_button(c, msg, kw):
                             break
 
+        except AuthKeyDuplicatedError:
+            log.error(f"🚫 [акк {idx}] СЕССИЯ ОТОЗВАНА — обнови SESSION_STR_{idx}")
+            dead_clients.add(idx)
         except Exception as e:
-            log.exception(f"❌ [акк {idx}] Ошибка обработки: {e}")
+            log.exception(f"❌ [акк {idx}] Ошибка: {e}")
 
     return handler
 
@@ -233,6 +266,10 @@ def make_handler(idx: int, c: TelegramClient):
 #                ОСНОВНОЕ ДЕЙСТВИЕ
 # =========================================================
 async def run_interaction(idx: int, c: TelegramClient):
+    if idx in dead_clients:
+        log.warning(f"⏭ [акк {idx}] пропущен (сессия отозвана)")
+        return
+
     try:
         log.info(f"▶️ [акк {idx}] Пишу '{START_COMMAND}' в {TARGET_BOT}")
         await human_pause(2.0, 6.0)
@@ -242,9 +279,13 @@ async def run_interaction(idx: int, c: TelegramClient):
         log.warning(f"   ⏳ [акк {idx}] FloodWait {e.seconds}с")
         await asyncio.sleep(e.seconds)
     except AuthKeyUnregisteredError:
-        log.error(f"   🚫 [акк {idx}] Сессия отозвана — обнови SESSION_STR_{idx}")
+        log.error(f"   🚫 [акк {idx}] Сессия отозвана")
+        dead_clients.add(idx)
+    except AuthKeyDuplicatedError:
+        log.error(f"   🚫 [акк {idx}] СЕССИЯ ОТОЗВАНА (дубликат IP)")
+        dead_clients.add(idx)
     except Exception as e:
-        log.exception(f"   ❌ [акк {idx}] Ошибка: {e}")
+        log.exception(f"   ❌ [акк {idx}] {e}")
 
 
 # =========================================================
@@ -269,8 +310,6 @@ def schedule_tasks():
         total = len(clients)
         log.info(f"⏰ Интервал: каждые {INTERVAL_MINUTES} мин • Аккаунтов: {total}")
         step_sec = (INTERVAL_MINUTES * 60) // max(total, 1)
-        log.info(f"📊 Сдвиг между аккаунтами: ~{step_sec} сек")
-
         for i, (idx, c) in enumerate(clients):
             offset_sec = i * step_sec
             scheduler.add_job(
@@ -306,6 +345,10 @@ async def main():
                 await human_pause(1.5, 3.5)
         except AuthKeyUnregisteredError:
             log.error(f"🚫 [акк {idx}] Сессия недействительна")
+            dead_clients.add(idx)
+        except AuthKeyDuplicatedError:
+            log.error(f"🚫 [акк {idx}] Сессия отозвана (дубликат IP)")
+            dead_clients.add(idx)
         except Exception as e:
             log.exception(f"❌ [акк {idx}] Ошибка запуска: {e}")
 
