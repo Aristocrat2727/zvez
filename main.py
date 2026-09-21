@@ -4,6 +4,7 @@ import asyncio
 import random
 import logging
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -15,6 +16,8 @@ from telethon.errors import (
     AuthKeyUnregisteredError,
     InviteHashExpiredError,
     InviteHashInvalidError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
 )
 from telethon.sessions import StringSession
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -35,7 +38,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("zvezdolov")
 
 # =========================================================
-#                    СЕССИИ (1..20)
+#                 СЛУЖЕБНЫЕ ССЫЛКИ TELEGRAM
+# =========================================================
+SKIP_USERNAMES = {
+    "share", "addstickers", "addemoji", "proxy", "socks",
+    "setlanguage", "joinchat", "iv", "c", "s", "addtheme",
+    "login", "confirmphone", "socks", "bg", "addlist",
+}
+
+
+# =========================================================
+#                    ЗАГРУЗКА СЕССИЙ
 # =========================================================
 SESSIONS = []
 for i in range(1, 21):
@@ -59,52 +72,94 @@ clients = [
 
 
 # =========================================================
-#                   ХЕЛПЕРЫ
+#                     ХЕЛПЕРЫ
 # =========================================================
 async def human_pause(min_s=1.0, max_s=3.0):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 
 def extract_invite_or_username(url: str):
-    """Возвращает ('invite', hash) или ('username', name) или None."""
+    """
+    Возвращает:
+      ('invite', hash)     — для t.me/+hash и t.me/joinchat/hash
+      ('username', name)   — для t.me/name
+      None                 — если служебная ссылка
+    """
     if not url:
         return None
+
+    # Игнорируем служебные ссылки
+    for skip in ("/share/", "/addstickers/", "/addemoji/", "/proxy",
+                 "/socks", "/setlanguage/", "/addtheme/", "/login",
+                 "/confirmphone", "/bg/", "/addlist"):
+        if skip in url:
+            return None
+
+    # Invite-ссылка: t.me/+hash  или  t.me/joinchat/hash
     m = re.search(r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", url)
     if m:
         return ("invite", m.group(1))
+
+    # Публичный канал: t.me/username
     m = re.search(r"t\.me/([A-Za-z][A-Za-z0-9_]{3,31})", url)
     if m:
-        return ("username", m.group(1))
+        username = m.group(1)
+        if username.lower() in SKIP_USERNAMES:
+            return None
+        return ("username", username)
+
     return None
 
 
 async def subscribe(c: TelegramClient, kind: str, value: str) -> bool:
-    """Подписка: по invite-хэшу или по username."""
+    """Подписка: по invite-хэшу или по username. Все ошибки обрабатываются."""
     try:
         if kind == "invite":
             await c(ImportChatInviteRequest(value))
-            log.info(f"   ✅ Подписался по invite: +{value}")
+            log.info(f"   ✅ Подписался (invite): +{value}")
         else:
             await c(JoinChannelRequest(value))
             log.info(f"   ✅ Подписался: @{value}")
         return True
+
     except UserAlreadyParticipantError:
         log.info(f"   ℹ️ Уже подписан: {value}")
         return True
+
     except InviteHashExpiredError:
         log.warning(f"   ⏰ Invite просрочена: +{value}")
         return False
+
     except InviteHashInvalidError:
         log.warning(f"   ❌ Неверный invite: +{value}")
         return False
+
     except ChannelPrivateError:
         log.warning(f"   🚫 Закрытый канал: {value}")
         return False
+
+    except (UsernameInvalidError, UsernameNotOccupiedError):
+        log.info(f"   ⏭ Пропуск (недействительный username): {value}")
+        return False
+
     except FloodWaitError as e:
-        log.warning(f"   ⏳ FloodWait {e.seconds}с")
+        log.warning(f"   ⏳ FloodWait {e.seconds}с — ждём")
         await asyncio.sleep(e.seconds)
         return False
+
+    except TypeError as e:
+        # "Cannot cast InputPeerUser to InputChannel" — ссылка на юзера/бота
+        if "InputPeerUser" in str(e) or "InputChannel" in str(e):
+            log.info(f"   ⏭ Пропуск (это юзер/бот, а не канал): {value}")
+            return False
+        log.warning(f"   ❌ TypeError: {e}")
+        return False
+
     except Exception as e:
+        err = str(e)
+        if "Nobody is using this username" in err or "username is unacceptable" in err:
+            log.info(f"   ⏭ Пропуск (невалидный username): {value}")
+            return False
         log.warning(f"   ❌ Ошибка подписки {value}: {e}")
         return False
 
@@ -117,7 +172,7 @@ async def press_button(c: TelegramClient, msg, keyword: str) -> bool:
         for btn in row:
             if keyword.lower() in btn.text.lower():
                 if btn.url:
-                    continue
+                    continue  # URL-кнопки не жмём через callback
                 try:
                     await btn.click()
                     log.info(f"   👆 Нажал: '{btn.text}'")
@@ -136,11 +191,13 @@ def make_handler(idx: int, c: TelegramClient):
         msg = event.message
         try:
             if msg.text:
-                log.info(f"💬 [акк {idx}] Бот: {msg.text[:100].replace(chr(10), ' | ')}")
+                short = msg.text[:110].replace(chr(10), " | ")
+                log.info(f"💬 [акк {idx}] Бот: {short}")
 
             if msg.buttons:
                 log.info(f"   🔘 [акк {idx}] Кнопок: {len(msg.buttons)}")
 
+                # 1. Собираем ссылки из URL-кнопок
                 links = []
                 for row in msg.buttons:
                     for btn in row:
@@ -150,21 +207,24 @@ def make_handler(idx: int, c: TelegramClient):
                                 links.append(info)
 
                 if links:
-                    log.info(f"   📡 [акк {idx}] Найдено каналов: {len(links)}")
+                    log.info(f"   📡 [акк {idx}] Каналов для подписки: {len(links)}")
                     for kind, value in links:
                         await subscribe(c, kind, value)
                         await human_pause(2.5, 6.0)
 
+                # 2. Жмём «Я подписался» / «Проверить»
                 clicked = await press_button(c, msg, "подписался")
                 if not clicked:
                     clicked = await press_button(c, msg, "проверить")
+
+                # 3. Если не нашли — пробуем другие полезные кнопки
                 if not clicked:
-                    for kw in ["забрать", "получить", "ускорить", "обновить"]:
+                    for kw in ["забрать", "получить", "ускорить", "обновить", "бонус"]:
                         if await press_button(c, msg, kw):
                             break
 
         except Exception as e:
-            log.exception(f"❌ [акк {idx}] Ошибка: {e}")
+            log.exception(f"❌ [акк {idx}] Ошибка обработки: {e}")
 
     return handler
 
@@ -182,9 +242,9 @@ async def run_interaction(idx: int, c: TelegramClient):
         log.warning(f"   ⏳ [акк {idx}] FloodWait {e.seconds}с")
         await asyncio.sleep(e.seconds)
     except AuthKeyUnregisteredError:
-        log.error(f"   🚫 [акк {idx}] Сессия отозвана")
+        log.error(f"   🚫 [акк {idx}] Сессия отозвана — обнови SESSION_STR_{idx}")
     except Exception as e:
-        log.exception(f"   ❌ [акк {idx}] {e}")
+        log.exception(f"   ❌ [акк {idx}] Ошибка: {e}")
 
 
 # =========================================================
@@ -206,9 +266,13 @@ def schedule_tasks():
                 replace_existing=True,
             )
     else:
-        log.info(f"⏰ Интервал: каждые {INTERVAL_MINUTES} мин")
+        total = len(clients)
+        log.info(f"⏰ Интервал: каждые {INTERVAL_MINUTES} мин • Аккаунтов: {total}")
+        step_sec = (INTERVAL_MINUTES * 60) // max(total, 1)
+        log.info(f"📊 Сдвиг между аккаунтами: ~{step_sec} сек")
+
         for i, (idx, c) in enumerate(clients):
-            offset_sec = i * (INTERVAL_MINUTES * 60 // max(len(clients), 1))
+            offset_sec = i * step_sec
             scheduler.add_job(
                 run_interaction,
                 trigger="interval",
@@ -243,7 +307,7 @@ async def main():
         except AuthKeyUnregisteredError:
             log.error(f"🚫 [акк {idx}] Сессия недействительна")
         except Exception as e:
-            log.exception(f"❌ [акк {idx}] {e}")
+            log.exception(f"❌ [акк {idx}] Ошибка запуска: {e}")
 
     if not started:
         log.error("❌ Ни один не запустился")
@@ -255,7 +319,7 @@ async def main():
     schedule_tasks()
     scheduler.start()
 
-    log.info("✅ Готово")
+    log.info("✅ Готово. Работаю.")
     await asyncio.gather(*(c.run_until_disconnected() for _, c in clients))
 
 
