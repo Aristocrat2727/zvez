@@ -296,30 +296,20 @@ scheduler = AsyncIOScheduler()
 
 def schedule_tasks():
     if TEST_MODE:
-        log.info("🧪 TEST_MODE: один запуск через 20 сек")
+        log.info(f"🧪 TEST_MODE: первый запуск через 20 сек, потом каждые {INTERVAL_MINUTES} мин")
+        total = len(clients)
+        step_sec = (INTERVAL_MINUTES * 60) // max(total, 1)
+        log.info(f"📊 Сдвиг между аккаунтами: ~{step_sec} сек")
+
         for i, (idx, c) in enumerate(clients):
             scheduler.add_job(
                 run_interaction,
-                trigger="date",
-                run_date=datetime.now(BONUS_TZ) + timedelta(seconds=20 + i * 3),
+                trigger="interval",                          # ← ИНТЕРВАЛ, не date
+                minutes=INTERVAL_MINUTES,                    # ← каждые 61 мин
                 args=[idx, c],
                 id=f"test_{idx}",
                 replace_existing=True,
-            )
-    else:
-        total = len(clients)
-        log.info(f"⏰ Интервал: каждые {INTERVAL_MINUTES} мин • Аккаунтов: {total}")
-        step_sec = (INTERVAL_MINUTES * 60) // max(total, 1)
-        for i, (idx, c) in enumerate(clients):
-            offset_sec = i * step_sec
-            scheduler.add_job(
-                run_interaction,
-                trigger="interval",
-                minutes=INTERVAL_MINUTES,
-                args=[idx, c],
-                id=f"task_{idx}",
-                replace_existing=True,
-                next_run_time=datetime.now(BONUS_TZ) + timedelta(seconds=offset_sec),
+                next_run_time=datetime.now(BONUS_TZ) + timedelta(seconds=20 + i * 3),
             )
 
 
